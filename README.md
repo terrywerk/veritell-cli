@@ -6,6 +6,7 @@ Standalone Python CLI scaffold for Veritell.
 
 - `src/veritell/` — package source
 - `tests/` — smoke tests for install/import/CLI behavior
+- `examples/` — runnable demo suite for CLI walkthroughs and CI gating demos
 - `docs/` — package notes and future design docs
 
 ## Canonical models
@@ -45,6 +46,16 @@ Built-in deterministic assertions now include:
 Built-in heuristic assertions now include:
 
 - `no_unsupported_claims`
+
+`no_unsupported_claims` now reports explainable unsupported text segments, per-span rationale, confidence, and the best matching context/reference span in failure details.
+
+Hybrid assertions can also use a selectable backend hierarchy:
+
+- assertion-level `backend` override
+- CLI `--judge heuristic|local|cloud`
+- configured default backend
+
+When the local judge is unavailable, supported hybrid assertions fall back to heuristics and include a clear note in terminal output and JSON details.
 
 Built-in scaffold assertions are registered on import and the runner now resolves each test-case assertion by `type` through the registry. Unsupported assertions return structured `AssertionResult` objects with `status="skip"` instead of crashing the run.
 
@@ -101,27 +112,113 @@ Issue 11 adds CI gating via a score threshold:
 
 The threshold is expressed on a `0-100` scale. When the suite score falls below that threshold, the command exits non-zero and includes gate metadata with both the threshold and actual score.
 
+Issue 13 adds a local judge backend for hybrid assertions:
+
+- `veritell test --judge local`
+- `veritell test examples/grounded_rag.yaml --judge local --json`
+
+Issue 15 adds backend selection hierarchy for hybrid and judge-based assertions:
+
+- `veritell test --judge heuristic`
+- `veritell test --judge local`
+- `veritell test --judge cloud`
+
 Examples:
 
 ```powershell
 veritell test
 veritell test --json
 veritell test --fail-below 80
+veritell test --judge heuristic
+veritell test --judge local
+veritell test --judge cloud
 veritell test tests/ai/ --json --fail-below 80
-veritell test tests/ai/fixtures/
+veritell test examples/
 ```
 
-## CLI shell
+## Backend selection hierarchy
 
-The initial Typer-based CLI exposes the Phase 1 command shell described in the project docs:
+Backend resolution follows this order:
 
-- `veritell test`
-- `veritell scan`
-- `veritell generate-evals`
-- `veritell import-evals`
-- `veritell diagnose`
+1. assertion-level `backend`
+2. CLI `--judge`
+3. configured default backend
+4. built-in fallback to `heuristic`
 
-For now, the CLI stays intentionally thin and delegates to scaffold handlers, but `veritell test` now executes a discovered suite and prints a summary like `1 passed, 0 failed, 0 errors, 0 skipped`.
+Deterministic assertions ignore CLI/default judge selection and continue running with their deterministic behavior.
+
+Hybrid assertions such as `no_unsupported_claims` switch according to the selected backend.
+
+## Local judge backend
+
+The local judge path is designed for offline local-model tools such as Ollama.
+
+### CLI usage
+
+```powershell
+veritell test --judge heuristic
+veritell test --judge local
+veritell test --judge cloud
+veritell test examples/grounded_rag.yaml --judge local
+veritell test examples/grounded_rag.yaml --judge local --json
+```
+
+### Default backend via env
+
+```powershell
+$env:VERITELL_DEFAULT_JUDGE = "local"
+$env:VERITELL_LOCAL_JUDGE_MODEL = "llama3.1:8b"
+$env:VERITELL_LOCAL_JUDGE_URL = "http://127.0.0.1:11434"
+veritell test
+```
+
+Supported backend selection environment variables:
+
+- `VERITELL_DEFAULT_JUDGE`
+- `VERITELL_JUDGE_BACKEND`
+
+Supported local-judge environment variables:
+
+- `VERITELL_LOCAL_JUDGE_MODEL`
+- `VERITELL_JUDGE_MODEL`
+- `OLLAMA_MODEL`
+- `VERITELL_LOCAL_JUDGE_URL`
+- `VERITELL_LOCAL_JUDGE_TIMEOUT`
+
+### Default backend via config
+
+You can create `veritell.toml` in the repository root:
+
+```toml
+[judge]
+default_backend = "local"
+
+[local_judge]
+model = "llama3.1:8b"
+base_url = "http://127.0.0.1:11434"
+timeout_seconds = 20
+```
+
+Or add the same settings to `pyproject.toml`:
+
+```toml
+[tool.veritell.judge]
+default_backend = "local"
+
+[tool.veritell.local_judge]
+model = "llama3.1:8b"
+base_url = "http://127.0.0.1:11434"
+timeout_seconds = 20
+```
+
+Configuration precedence is:
+
+- assertion-level `backend`
+- CLI backend selection (`--judge ...`)
+- default backend from env/config
+- built-in defaults
+
+If the local judge is unavailable, hybrid assertions such as `no_unsupported_claims` fall back to heuristics automatically. If `cloud` is selected before a cloud backend is configured, hybrid assertions return a clear `method="cloud"` error result instead of silently changing backend.
 
 ## Local development
 
@@ -146,49 +243,64 @@ veritell test
 veritell test tests/ai/
 ```
 
-The repository also ships runnable examples under `tests/ai/fixtures/`:
+The repository also ships a runnable demo suite under `examples/`:
 
 - `grounded_rag.yaml`
 - `abstention.yaml`
 - `structured_output.yaml`
+- `hallucination_failure.yaml`
 
-### What each fixture demonstrates
+### What each demo demonstrates
 
 - `grounded_rag.yaml`
   - grounded RAG validation
   - assertions: `expected_doc_retrieved`, `retrieval_contains_answer`, `no_unsupported_claims`
 - `abstention.yaml`
-  - refusal/abstention when the evidence is missing
+  - refusal/abstention when evidence is missing
   - assertions: `should_abstain`, `no_unsupported_claims`
 - `structured_output.yaml`
   - JSON formatting and schema validation
   - assertions: `response_format_valid`, `json_schema_valid`
-  - schema file: `tests/ai/fixtures/refund_policy_schema.json`
+  - schema file: `examples/refund_policy_schema.json`
+- `hallucination_failure.yaml`
+  - intentional hallucination failure
+  - assertion: `no_unsupported_claims`
+  - demonstrates unsupported span highlighting plus CI gating
 
-From the repo root, you can run the full example directory with:
+From the repo root, you can run the full demo directory with:
 
 ```powershell
-veritell test tests/ai/fixtures/
-veritell test tests/ai/fixtures/ --json
-veritell test tests/ai/fixtures/ --fail-below 80
+veritell test examples/
+veritell test examples/ --json
 ```
+
+The full demo suite includes one intentional failure (`hallucination_failure.yaml`), so it exits non-zero by design. That makes it useful for demos and CI gating walkthroughs.
 
 You can also run a single example file:
 
 ```powershell
-veritell test tests/ai/fixtures/grounded_rag.yaml
-veritell test tests/ai/fixtures/abstention.yaml
-veritell test tests/ai/fixtures/structured_output.yaml --json
+veritell test examples/grounded_rag.yaml
+veritell test examples/abstention.yaml
+veritell test examples/structured_output.yaml --json
+veritell test examples/hallucination_failure.yaml
+```
+
+CI gating examples:
+
+```powershell
+veritell test examples/grounded_rag.yaml --fail-below 80
+veritell test examples/hallucination_failure.yaml --fail-below 80
 ```
 
 Typical terminal output includes:
 
-- one section per test
-- per-assertion status, method, and confidence
-- a suite summary line
+- one summary line per test
+- failure-only assertion detail blocks
+- unsupported span highlights when present
+- a suite reliability line
 - optional CI gate metadata when `--fail-below` is used
 
-For a slightly longer walkthrough, see `docs/examples.md`.
+For a slightly longer walkthrough, see `examples/README.md` and `docs/examples.md`.
 
 ## Current scope
 

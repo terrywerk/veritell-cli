@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .backends import build_judge_context
 from .loader import InvalidTestCaseError, load_test_suite
 from .reporters import render_json_report, render_terminal_report
 from .runner import run_test_suite
@@ -23,13 +24,21 @@ class VeritellCLIError(RuntimeError):
     """Raised when a CLI command cannot complete successfully."""
 
 
-def run_test(path: Path, json_output: bool = False, fail_below: float | None = None) -> CommandResult:
+def run_test(
+    path: Path,
+    json_output: bool = False,
+    fail_below: float | None = None,
+    judge: str | None = None,
+) -> CommandResult:
     try:
         cases = load_test_suite(path)
+        judge_context = build_judge_context(judge, base_dir=Path.cwd())
     except InvalidTestCaseError as exc:
         raise VeritellCLIError(str(exc)) from exc
+    except ValueError as exc:
+        raise VeritellCLIError(str(exc)) from exc
 
-    suite = run_test_suite(cases)
+    suite = run_test_suite(cases, judge_context=judge_context)
     gate = _build_gate_result(suite.summary.score, fail_below)
     report = render_json_report(path, suite, gate=gate) if json_output else render_terminal_report(path, suite, gate=gate)
     exit_code = 1 if (suite.summary.failed or suite.summary.errors or (gate is not None and not gate["passed"])) else 0

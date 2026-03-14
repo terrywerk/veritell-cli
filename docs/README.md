@@ -4,4 +4,4 @@ This folder is reserved for Veritell CLI design notes, issue markdowns, and impl
 
 ## Available guides
 
-- `examples.md` — walkthrough of the shipped example fixtures under `tests/ai/fixtures/`
+- `examples.md` — walkthrough of the runnable demo suite under `examples/`

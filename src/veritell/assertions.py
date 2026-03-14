@@ -12,6 +12,7 @@ from typing import Any
 from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema import validate as validate_json_schema
 
+from .backends import JudgeExecutionContext, LocalJudgeBackendError, LocalJudgeBackendUnavailable
 from .models import AssertionResult, VeritellTestCase
 
 AssertionRegistry = dict[str, "Assertion"]
@@ -36,7 +37,7 @@ _STOPWORDS = {
 }
 _SUPPORTED_FORMATS = {"json", "markdown", "bullet_list"}
 _CLAIM_SPLIT_RE = re.compile(r"[.!?;\n]+")
-_TOKEN_RE = re.compile(r"[a-z0-9']+")
+_TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
 _HALLUCINATION_THRESHOLD = 0.72
 _REGISTRY: AssertionRegistry = {}
 
@@ -57,6 +58,7 @@ class Assertion(ABC):
         *,
         backend: str = "heuristic",
         params: Mapping[str, Any] | None = None,
+        judge_context: JudgeExecutionContext | None = None,
     ) -> AssertionResult:
         """Evaluate a test case response and return a structured assertion result."""
 
@@ -74,6 +76,7 @@ class ResponseFormatValidAssertion(Assertion):
         *,
         backend: str = "heuristic",
         params: Mapping[str, Any] | None = None,
+        judge_context: JudgeExecutionContext | None = None,
     ) -> AssertionResult:
         config = params or {}
         expected_format = str(config.get("format") or "json").strip().lower()
@@ -140,6 +143,7 @@ class JsonSchemaValidAssertion(Assertion):
         *,
         backend: str = "heuristic",
         params: Mapping[str, Any] | None = None,
+        judge_context: JudgeExecutionContext | None = None,
     ) -> AssertionResult:
         config = params or {}
         schema = _resolve_json_schema(testcase, config)
@@ -195,6 +199,7 @@ class ExactMatchAssertion(Assertion):
         *,
         backend: str = "heuristic",
         params: Mapping[str, Any] | None = None,
+        judge_context: JudgeExecutionContext | None = None,
     ) -> AssertionResult:
         expected = _resolve_expected_answer(testcase, params or {})
         if expected is None:
@@ -231,6 +236,7 @@ class ExpectedDocRetrievedAssertion(Assertion):
         *,
         backend: str = "heuristic",
         params: Mapping[str, Any] | None = None,
+        judge_context: JudgeExecutionContext | None = None,
     ) -> AssertionResult:
         expected_docs = _coerce_docs(testcase.context.get("expected_docs"))
         retrieved_docs = _coerce_docs(testcase.context.get("retrieved_docs"))
@@ -264,6 +270,7 @@ class RetrievalContainsAnswerAssertion(Assertion):
         *,
         backend: str = "heuristic",
         params: Mapping[str, Any] | None = None,
+        judge_context: JudgeExecutionContext | None = None,
     ) -> AssertionResult:
         reference_answer = _resolve_expected_answer(testcase, params or {})
         retrieved_docs = _coerce_docs(testcase.context.get("retrieved_docs"))
@@ -289,7 +296,7 @@ class NoUnsupportedClaimsAssertion(Assertion):
     name = "no_unsupported_claims"
 
     def supported_backends(self) -> tuple[str, ...]:
-        return ("heuristic",)
+        return ("heuristic", "local", "cloud")
 
     def evaluate(
         self,
@@ -298,9 +305,30 @@ class NoUnsupportedClaimsAssertion(Assertion):
         *,
         backend: str = "heuristic",
         params: Mapping[str, Any] | None = None,
+        judge_context: JudgeExecutionContext | None = None,
     ) -> AssertionResult:
-        context_segments = _collect_context_segments(testcase)
-        if not context_segments:
+        if backend in {"local", "cloud"}:
+            judge_result = _evaluate_with_judge_backend(
+                self.name,
+                testcase,
+                response,
+                backend=backend,
+                judge_context=judge_context,
+                heuristic_factory=lambda fallback_reason: self._evaluate_heuristic(testcase, response, fallback_reason=fallback_reason),
+            )
+            if judge_result is not None:
+                return judge_result
+        return self._evaluate_heuristic(testcase, response)
+
+    def _evaluate_heuristic(
+        self,
+        testcase: VeritellTestCase,
+        response: str,
+        *,
+        fallback_reason: str | None = None,
+    ) -> AssertionResult:
+        context_evidence = _collect_context_evidence(testcase)
+        if not context_evidence:
             return AssertionResult(
                 assertion=self.name,
                 status="error",
@@ -319,38 +347,35 @@ class NoUnsupportedClaimsAssertion(Assertion):
                 details={"reason": "response did not contain any analyzable claims", "actual": response},
             )
 
-        analyses: list[dict[str, Any]] = []
+        claim_analyses: list[dict[str, Any]] = []
         unsupported_spans: list[str] = []
+        unsupported_span_analyses: list[dict[str, Any]] = []
         supported_spans: list[str] = []
         scores: list[float] = []
 
         for claim in claims:
-            claim_tokens = _content_tokens(claim)
-            if not claim_tokens:
+            analysis = _analyze_claim_support(claim, context_evidence)
+            if analysis is None:
                 continue
-
-            best_score = 0.0
-            best_context = ""
-            for context_segment in context_segments:
-                score = _claim_support_score(claim, claim_tokens, context_segment)
-                if score > best_score:
-                    best_score = score
-                    best_context = context_segment
-
-            rounded_score = round(best_score, 3)
-            scores.append(rounded_score)
-            analyses.append({
-                "claim": claim,
-                "support_score": rounded_score,
-                "matched_context": best_context,
-            })
-
-            if best_score >= _HALLUCINATION_THRESHOLD:
+            claim_analyses.append(analysis)
+            scores.append(analysis["support_score"])
+            if analysis["unsupported_segments"]:
+                unsupported_spans.extend(analysis["unsupported_segments"])
+                unsupported_span_analyses.extend(
+                    {
+                        "span": segment,
+                        "claim": claim,
+                        "rationale": analysis["rationale"],
+                        "matched_context": analysis["matched_context"],
+                        "matched_context_source": analysis["matched_context_source"],
+                        "support_score": analysis["support_score"],
+                    }
+                    for segment in analysis["unsupported_segments"]
+                )
+            elif analysis["support_score"] >= _HALLUCINATION_THRESHOLD:
                 supported_spans.append(claim)
-            else:
-                unsupported_spans.append(claim)
 
-        if not analyses:
+        if not claim_analyses:
             return AssertionResult(
                 assertion=self.name,
                 status="error",
@@ -362,24 +387,31 @@ class NoUnsupportedClaimsAssertion(Assertion):
         passed = not unsupported_spans
         reference_score = (sum(scores) / len(scores)) if passed else min(scores)
         confidence = _hallucination_confidence(reference_score, passed=passed)
+        details = {
+            "supported_spans": supported_spans,
+            "unsupported_spans": _dedupe_strings(unsupported_spans),
+            "unsupported_span_analyses": unsupported_span_analyses,
+            "claim_analyses": claim_analyses,
+            "context_span_count": len(context_evidence),
+            "threshold": _HALLUCINATION_THRESHOLD,
+        }
+        if fallback_reason is not None:
+            details["fallback_reason"] = fallback_reason
         return AssertionResult(
             assertion=self.name,
             status="pass" if passed else "fail",
             method="heuristic",
             confidence=confidence,
-            details={
-                "supported_spans": supported_spans,
-                "unsupported_spans": unsupported_spans,
-                "claim_analyses": analyses,
-                "context_span_count": len(context_segments),
-                "threshold": _HALLUCINATION_THRESHOLD,
-            },
+            details=details,
         )
 
 
 class ShouldAbstainAssertion(Assertion):
     name = "should_abstain"
 
+    def supported_backends(self) -> tuple[str, ...]:
+        return ("heuristic", "local", "cloud")
+
     def evaluate(
         self,
         testcase: VeritellTestCase,
@@ -387,20 +419,41 @@ class ShouldAbstainAssertion(Assertion):
         *,
         backend: str = "heuristic",
         params: Mapping[str, Any] | None = None,
+        judge_context: JudgeExecutionContext | None = None,
     ) -> AssertionResult:
+        if backend in {"local", "cloud"}:
+            judge_result = _evaluate_with_judge_backend(
+                self.name,
+                testcase,
+                response,
+                backend=backend,
+                judge_context=judge_context,
+                heuristic_factory=lambda fallback_reason: self._evaluate_heuristic(response, fallback_reason=fallback_reason),
+            )
+            if judge_result is not None:
+                return judge_result
+        return self._evaluate_heuristic(response)
+
+    def _evaluate_heuristic(self, response: str, *, fallback_reason: str | None = None) -> AssertionResult:
         passed = _looks_like_abstention(response)
+        details = {"actual": response}
+        if fallback_reason is not None:
+            details["fallback_reason"] = fallback_reason
         return AssertionResult(
             assertion=self.name,
             status="pass" if passed else "fail",
-            method=backend,
+            method="heuristic",
             confidence=1.0,
-            details={"actual": response},
+            details=details,
         )
 
 
 class ShouldAnswerAssertion(Assertion):
     name = "should_answer"
 
+    def supported_backends(self) -> tuple[str, ...]:
+        return ("heuristic", "local", "cloud")
+
     def evaluate(
         self,
         testcase: VeritellTestCase,
@@ -408,14 +461,32 @@ class ShouldAnswerAssertion(Assertion):
         *,
         backend: str = "heuristic",
         params: Mapping[str, Any] | None = None,
+        judge_context: JudgeExecutionContext | None = None,
     ) -> AssertionResult:
+        if backend in {"local", "cloud"}:
+            judge_result = _evaluate_with_judge_backend(
+                self.name,
+                testcase,
+                response,
+                backend=backend,
+                judge_context=judge_context,
+                heuristic_factory=lambda fallback_reason: self._evaluate_heuristic(response, fallback_reason=fallback_reason),
+            )
+            if judge_result is not None:
+                return judge_result
+        return self._evaluate_heuristic(response)
+
+    def _evaluate_heuristic(self, response: str, *, fallback_reason: str | None = None) -> AssertionResult:
         passed = bool(response.strip()) and not _looks_like_abstention(response)
+        details = {"actual": response}
+        if fallback_reason is not None:
+            details["fallback_reason"] = fallback_reason
         return AssertionResult(
             assertion=self.name,
             status="pass" if passed else "fail",
-            method=backend,
+            method="heuristic",
             confidence=1.0,
-            details={"actual": response},
+            details=details,
         )
 
 
@@ -432,6 +503,7 @@ class UnsupportedAssertion(Assertion):
         *,
         backend: str = "heuristic",
         params: Mapping[str, Any] | None = None,
+        judge_context: JudgeExecutionContext | None = None,
     ) -> AssertionResult:
         return AssertionResult(
             assertion=self.name,
@@ -482,13 +554,15 @@ def evaluate_registered_assertion(
     testcase: VeritellTestCase,
     assertion_config: Mapping[str, Any],
     response: str,
+    *,
+    judge_context: JudgeExecutionContext | None = None,
 ) -> AssertionResult:
     """Resolve an assertion from the registry and evaluate it against a response."""
 
     assertion_name = str(assertion_config.get("type", "")).strip()
-    backend = str(assertion_config.get("backend") or "heuristic")
     params = assertion_config.get("params") if isinstance(assertion_config.get("params"), Mapping) else {}
     assertion = get_assertion(assertion_name) or UnsupportedAssertion(assertion_name)
+    backend = _resolve_backend(assertion, assertion_config, judge_context)
 
     if backend not in assertion.supported_backends():
         supported = ", ".join(assertion.supported_backends())
@@ -499,7 +573,7 @@ def evaluate_registered_assertion(
             details={"reason": f"backend '{backend}' is not supported for assertion '{assertion_name}'; supported backends: {supported}"},
         )
 
-    return assertion.evaluate(testcase, response, backend=backend, params=params)
+    return assertion.evaluate(testcase, response, backend=backend, params=params, judge_context=judge_context)
 
 
 def _resolve_expected_answer(testcase: VeritellTestCase, params: Mapping[str, Any]) -> str | None:
@@ -553,16 +627,25 @@ def _coerce_docs(value: Any) -> list[str]:
 
 
 def _collect_context_segments(testcase: VeritellTestCase) -> list[str]:
-    segments: list[str] = []
+    return [item["text"] for item in _collect_context_evidence(testcase)]
+
+
+def _collect_context_evidence(testcase: VeritellTestCase) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
     reference_answer = testcase.context.get("reference_answer")
     if isinstance(reference_answer, str) and reference_answer.strip():
-        segments.extend(_split_claims(reference_answer) or [reference_answer.strip()])
+        for segment in _split_claims(reference_answer) or [reference_answer.strip()]:
+            if _content_tokens(segment):
+                evidence.append({"text": segment, "source": "reference_answer", "source_label": "reference_answer"})
 
-    for document in _coerce_docs(testcase.context.get("retrieved_docs")):
-        if document.strip():
-            segments.extend(_split_claims(document) or [document.strip()])
+    for index, document in enumerate(_coerce_docs(testcase.context.get("retrieved_docs"))):
+        if not document.strip():
+            continue
+        for segment in _split_claims(document) or [document.strip()]:
+            if _content_tokens(segment):
+                evidence.append({"text": segment, "source": "retrieved_docs", "source_label": f"retrieved_docs[{index}]"})
 
-    return [segment for segment in segments if _content_tokens(segment)]
+    return evidence
 
 
 def _split_claims(text: str) -> list[str]:
@@ -619,6 +702,205 @@ def _hallucination_confidence(score: float, *, passed: bool) -> float:
 def _looks_like_abstention(text: str) -> bool:
     lowered = text.lower()
     return any(marker in lowered for marker in _ABSTENTION_MARKERS)
+
+
+def _resolve_backend(
+    assertion: Assertion,
+    assertion_config: Mapping[str, Any],
+    judge_context: JudgeExecutionContext | None,
+) -> str:
+    configured_backend = assertion_config.get("backend")
+    if isinstance(configured_backend, str) and configured_backend.strip():
+        return configured_backend.strip().lower()
+
+    preferred = judge_context.preferred_backend if judge_context is not None else None
+    if preferred is not None and preferred in assertion.supported_backends():
+        return preferred
+
+    default_backend = judge_context.default_backend if judge_context is not None else None
+    if default_backend is not None and default_backend in assertion.supported_backends():
+        return default_backend
+    return "heuristic"
+
+
+def _evaluate_with_judge_backend(
+    assertion_name: str,
+    testcase: VeritellTestCase,
+    response: str,
+    *,
+    backend: str,
+    judge_context: JudgeExecutionContext | None,
+    heuristic_factory,
+) -> AssertionResult | None:
+    if backend == "local":
+        local_backend = judge_context.local_backend if judge_context is not None else None
+        if local_backend is None:
+            return heuristic_factory("local judge backend not configured")
+        try:
+            return local_backend.evaluate_assertion(assertion_name, testcase, response, params=None)
+        except LocalJudgeBackendUnavailable as exc:
+            return heuristic_factory(str(exc))
+        except LocalJudgeBackendError as exc:
+            return AssertionResult(
+                assertion=assertion_name,
+                status="error",
+                method="local",
+                confidence=0.0,
+                details={"reason": str(exc)},
+            )
+
+    if backend == "cloud":
+        return AssertionResult(
+            assertion=assertion_name,
+            status="error",
+            method="cloud",
+            confidence=0.0,
+            details={"reason": "cloud judge backend is not configured yet"},
+        )
+
+    return None
+
+
+def _content_token_infos(text: str) -> list[dict[str, Any]]:
+    infos: list[dict[str, Any]] = []
+    for ordinal, match in enumerate(_TOKEN_RE.finditer(text)):
+        token = match.group(0)
+        normalized = token.lower()
+        if normalized in _STOPWORDS or not (len(normalized) > 2 or normalized.isdigit() or normalized in _NEGATION_MARKERS):
+            continue
+        infos.append(
+            {
+                "token": token,
+                "normalized": normalized,
+                "start": match.start(),
+                "end": match.end(),
+                "ordinal": ordinal,
+            }
+        )
+    return infos
+
+
+def _analyze_claim_support(claim: str, context_evidence: list[dict[str, Any]]) -> dict[str, Any] | None:
+    claim_token_infos = _content_token_infos(claim)
+    claim_tokens = [info["normalized"] for info in claim_token_infos]
+    if not claim_tokens:
+        return None
+
+    best_evidence: dict[str, Any] | None = None
+    best_score = 0.0
+    for evidence in context_evidence:
+        score = _claim_support_score(claim, claim_tokens, evidence["text"])
+        if score > best_score:
+            best_score = score
+            best_evidence = evidence
+
+    matched_context = best_evidence["text"] if best_evidence is not None else ""
+    matched_context_source = best_evidence["source_label"] if best_evidence is not None else "none"
+    context_tokens = set(_content_tokens(matched_context)) if matched_context else set()
+
+    missing_infos = [info for info in claim_token_infos if info["normalized"] not in context_tokens]
+    unsupported_segments = _merge_infos_into_spans(claim, missing_infos)
+
+    claim_numbers = {token for token in claim_tokens if token.isdigit()}
+    context_numbers = {token for token in context_tokens if token.isdigit()}
+    number_mismatches = sorted(claim_numbers - context_numbers)
+
+    claim_has_negation = any(token in _NEGATION_MARKERS for token in claim_tokens)
+    context_has_negation = any(token in _NEGATION_MARKERS for token in context_tokens)
+    negation_mismatch = claim_has_negation != context_has_negation
+    if negation_mismatch and claim not in unsupported_segments:
+        unsupported_segments.append(claim)
+
+    if best_score < _HALLUCINATION_THRESHOLD and not unsupported_segments:
+        unsupported_segments = [claim]
+
+    unsupported_segments = _dedupe_strings(unsupported_segments)
+    rationale = _build_unsupported_rationale(
+        claim,
+        matched_context=matched_context,
+        matched_context_source=matched_context_source,
+        missing_terms=[info["token"] for info in missing_infos],
+        number_mismatches=number_mismatches,
+        negation_mismatch=negation_mismatch,
+        support_score=best_score,
+        passed=not unsupported_segments,
+    )
+
+    return {
+        "claim": claim,
+        "support_score": round(best_score, 3),
+        "matched_context": matched_context,
+        "matched_context_source": matched_context_source,
+        "missing_terms": _dedupe_strings([info["token"] for info in missing_infos]),
+        "number_mismatches": number_mismatches,
+        "negation_mismatch": negation_mismatch,
+        "unsupported_segments": unsupported_segments,
+        "rationale": rationale,
+    }
+
+
+def _merge_infos_into_spans(text: str, infos: list[dict[str, Any]], *, max_ordinal_gap: int = 2) -> list[str]:
+    if not infos:
+        return []
+    ordered = sorted(infos, key=lambda info: info["ordinal"])
+    groups: list[list[dict[str, Any]]] = [[ordered[0]]]
+    for info in ordered[1:]:
+        current_group = groups[-1]
+        if info["ordinal"] - current_group[-1]["ordinal"] <= max_ordinal_gap:
+            current_group.append(info)
+        else:
+            groups.append([info])
+
+    spans: list[str] = []
+    for group in groups:
+        start = group[0]["start"]
+        end = group[-1]["end"]
+        spans.append(_clean_span(text[start:end]))
+    return [span for span in spans if span]
+
+
+def _clean_span(text: str) -> str:
+    return text.strip(" ,.;:!?()[]{}\"'")
+
+def _build_unsupported_rationale(
+    claim: str,
+    *,
+    matched_context: str,
+    matched_context_source: str,
+    missing_terms: list[str],
+    number_mismatches: list[str],
+    negation_mismatch: bool,
+    support_score: float,
+    passed: bool,
+) -> str:
+    if passed:
+        return f"claim is supported by {matched_context_source} with support score {support_score:.3f}"
+
+    reasons: list[str] = []
+    if number_mismatches:
+        reasons.append(f"numbers not found in matched context: {', '.join(number_mismatches)}")
+    if negation_mismatch:
+        reasons.append("negation mismatch with matched context")
+    if missing_terms:
+        reasons.append(f"missing terms: {', '.join(_dedupe_strings(missing_terms))}")
+    if matched_context:
+        reasons.append(f"best match came from {matched_context_source}: {matched_context}")
+    else:
+        reasons.append("no supporting context segment was found")
+    reasons.append(f"support score {support_score:.3f} is below threshold {_HALLUCINATION_THRESHOLD:.2f}")
+    return "; ".join(reasons)
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        cleaned = value.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        ordered.append(cleaned)
+    return ordered
 
 
 for _builtin in (

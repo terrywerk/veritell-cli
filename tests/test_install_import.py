@@ -6,11 +6,15 @@ import veritell
 from veritell import (
     Assertion,
     AssertionResult,
+    JudgeExecutionContext,
+    LocalJudgeSettings,
     VeritellRunSummary,
     VeritellSuiteResult,
     VeritellTestCase,
     VeritellTestResult,
+    build_judge_context,
     get_assertion,
+    load_local_judge_settings,
     register_assertion,
     unregister_assertion,
 )
@@ -23,11 +27,15 @@ def test_package_imports() -> None:
     assert veritell.__version__ == "0.1.0"
     assert callable(main)
     assert Assertion is not None
+    assert JudgeExecutionContext is not None
+    assert LocalJudgeSettings is not None
     assert VeritellTestCase is not None
     assert AssertionResult is not None
     assert VeritellTestResult is not None
     assert VeritellRunSummary is not None
     assert VeritellSuiteResult is not None
+    assert callable(build_judge_context)
+    assert callable(load_local_judge_settings)
     assert callable(register_assertion)
     assert callable(unregister_assertion)
     assert get_assertion("exact_match") is not None

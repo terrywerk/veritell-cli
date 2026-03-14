@@ -1,4 +1,3 @@
-
 # Veritell Assertions Specification
 
 ## Purpose
@@ -124,7 +123,14 @@ Example:
   "confidence": 0.64,
   "details": {
     "unsupported_spans": [
-      "contractors receive 15 PTO days"
+      "45"
+    ],
+    "unsupported_span_analyses": [
+      {
+        "span": "45",
+        "claim": "Refunds are allowed within 45 days of purchase.",
+        "rationale": "numbers not found in matched context: 45; best match came from retrieved_docs[0]: Refunds are allowed within 30 days of purchase.; support score 0.833 is below threshold 0.72"
+      }
     ]
   }
 }
@@ -137,6 +143,8 @@ Fields:
 - method: heuristic / local / cloud
 - confidence: evaluation confidence
 - details: diagnostic metadata
+- details.unsupported_spans: list of unsupported text segments
+- details.unsupported_span_analyses: per-span rationale and best matching context metadata
 
 ---
 
@@ -173,7 +181,7 @@ All assertions implement a common interface.
 
 Example:
 
-```python
+```text
 class Assertion:
 
     name: str
@@ -187,7 +195,7 @@ class Assertion:
 
 Example implementation:
 
-```python
+```text
 class NoUnsupportedClaims(Assertion):
 
     def evaluate(self, response, context, backend="heuristic"):
@@ -214,7 +222,7 @@ Assertions become the **standard vocabulary for AI reliability testing**.
 
 Example:
 
-```python
+```text
 assert no_unsupported_claims
 assert retrieval_contains_answer
 assert should_abstain

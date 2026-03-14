@@ -61,10 +61,14 @@ def test_command(
         float | None,
         typer.Option("--fail-below", help="Exit non-zero when the suite score is below this 0-100 threshold."),
     ] = None,
+    judge: Annotated[
+        str | None,
+        typer.Option("--judge", help="Preferred backend for hybrid or judge-based assertions: heuristic, local, or cloud."),
+    ] = None,
 ) -> None:
     """Run a Veritell test suite."""
 
-    _run_delegate(commands.run_test, path, json_output, fail_below)
+    _run_delegate(commands.run_test, path, json_output, fail_below, judge)
 
 
 @app.command("scan")

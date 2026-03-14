@@ -1,8 +1,8 @@
 # Example Fixtures
 
-Veritell ships a small runnable example suite under `tests/ai/fixtures/`.
+Veritell ships a runnable demo suite under `examples/`.
 
-These fixtures are designed to run locally without external services. Each one includes a `metadata.mock_response` value so `veritell test` can execute the suite immediately from a fresh checkout.
+These examples are designed to run locally without external services. Each one includes a `metadata.mock_response` value so `veritell test` can execute the suite immediately from a fresh checkout.
 
 ## Included fixtures
 
@@ -50,21 +50,36 @@ What it checks:
 - the response is valid JSON
 - the JSON matches the required output schema
 
+### `hallucination_failure.yaml`
+
+Purpose:
+- demonstrate an intentional hallucination failure
+
+Assertions used:
+- `no_unsupported_claims`
+
+What it checks:
+- unsupported spans are highlighted when the response contradicts the documented refund window
+- CI gating can fail on a low-reliability example
+
 ## Run the examples
 
 From the repository root:
 
 ```powershell
-veritell test tests/ai/fixtures/
-veritell test tests/ai/fixtures/ --json
-veritell test tests/ai/fixtures/ --fail-below 80
+veritell test examples/
+veritell test examples/ --json
 ```
+
+The full demo suite includes one intentional failing example, so the directory-level run exits non-zero by design.
 
 Run a single example file:
 
 ```powershell
-veritell test tests/ai/fixtures/grounded_rag.yaml
-veritell test tests/ai/fixtures/structured_output.yaml --json
+veritell test examples/grounded_rag.yaml
+veritell test examples/abstention.yaml
+veritell test examples/structured_output.yaml --json
+veritell test examples/hallucination_failure.yaml
 ```
 
 ## Expected output
@@ -74,38 +89,35 @@ veritell test tests/ai/fixtures/structured_output.yaml --json
 Run:
 
 ```powershell
-veritell test tests/ai/fixtures/grounded_rag.yaml
+veritell test examples/grounded_rag.yaml
 ```
 
 Key lines:
 
 ```text
-Suite: tests/ai/fixtures/grounded_rag.yaml
-Test grounded_rag_contractors_pto-<generated-id>: status=pass score=1.00
-  - expected_doc_retrieved: status=pass method=deterministic confidence=1.000
-  - retrieval_contains_answer: status=pass method=deterministic confidence=1.000
-  - no_unsupported_claims: status=pass method=heuristic confidence=<heuristic-confidence>
-Summary: total=1 passed=1 failed=0 errors=0 skipped=0 score=1.00
+Suite: examples/grounded_rag.yaml
+PASS demo_grounded_rag_contractors_pto-<generated-id> score=1.00 assertions=3/3 methods=deterministic,heuristic
+Summary: total=1 passed=1 failed=0 errors=0 skipped=0 reliability=100.00% score=1.00
 ```
 
 Notes:
 
 - fixture-derived test IDs include a stable generated suffix unless the file declares an explicit `id`
-- heuristic confidence is included, but the exact numeric value may change as the heuristic evolves
+- failure output expands only the failing assertions, which keeps CI logs readable while still surfacing details like unsupported spans and rationale
 
 ### JSON mode
 
 Run:
 
 ```powershell
-veritell test tests/ai/fixtures/grounded_rag.yaml --json
+veritell test examples/grounded_rag.yaml --json
 ```
 
 Key shape:
 
 ```json
 {
-  "path": "tests/ai/fixtures/grounded_rag.yaml",
+  "path": "examples/grounded_rag.yaml",
   "summary": {
     "total": 1,
     "passed": 1,
@@ -116,7 +128,7 @@ Key shape:
   },
   "results": [
     {
-      "test_id": "grounded_rag_contractors_pto-<generated-id>",
+      "test_id": "demo_grounded_rag_contractors_pto-<generated-id>",
       "status": "pass",
       "score": 1.0,
       "assertion_results": [
@@ -129,27 +141,49 @@ Key shape:
 }
 ```
 
-### Failing output with `--fail-below`
+### Hallucination failure example
 
 Run:
 
 ```powershell
-veritell test <suite-path> --fail-below 80
+veritell test examples/hallucination_failure.yaml
 ```
 
 Key lines:
 
 ```text
-Summary: total=1 passed=1 failed=0 errors=0 skipped=1 score=0.50
-Gate: threshold=80.00 score=50.00 passed=false
+FAIL demo_hallucination_failure_refund_window-<generated-id> score=0.00 assertions=0/1 methods=heuristic
+  failed assertions:
+    - no_unsupported_claims [fail] method=heuristic confidence=<heuristic-confidence>
+      unsupported spans:
+        - "45"
 ```
 
-This still prints the full report, but the command exits non-zero because `passed=false`.
+### CI gating demo
+
+Passing gate example:
+
+```powershell
+veritell test examples/grounded_rag.yaml --fail-below 80
+```
+
+Failing gate example:
+
+```powershell
+veritell test examples/hallucination_failure.yaml --fail-below 80
+```
+
+Representative failing gate lines:
+
+```text
+Summary: total=1 passed=0 failed=1 errors=0 skipped=0 reliability=0.00% score=0.00
+Gate: threshold=80.00 score=0.00 passed=false
+```
 
 JSON mode:
 
 ```powershell
-veritell test <suite-path> --json --fail-below 80
+veritell test examples/hallucination_failure.yaml --json --fail-below 80
 ```
 
 Key shape:
@@ -157,11 +191,11 @@ Key shape:
 ```json
 {
   "summary": {
-    "score": 0.5
+    "score": 0.0
   },
   "gate": {
     "threshold": 80.0,
-    "score": 50.0,
+    "score": 0.0,
     "passed": false
   }
 }
@@ -172,7 +206,7 @@ Key shape:
 Terminal mode includes:
 - suite path
 - per-test status and score
-- per-assertion status, method, and confidence
+- failure-only assertion detail blocks
 - suite summary
 - optional CI gate information
 
@@ -184,5 +218,5 @@ JSON mode includes:
 
 ## Notes
 
-- Discovery intentionally ignores helper schema assets that end with `_schema.json`, so the schema file can live beside the runnable fixtures.
-- The examples are meant to be small and readable first; they are not intended to represent a full production evaluation suite.
+- Discovery intentionally ignores helper schema assets that end with `_schema.json`, so the schema file can live beside the runnable examples.
+- The demo suite is intentionally small and readable; it is meant for walkthroughs, onboarding, and CI gating demos.

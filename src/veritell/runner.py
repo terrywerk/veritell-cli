@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from .assertions import evaluate_registered_assertion
+from .backends import JudgeExecutionContext
 from .models import (
     AssertionResult,
     VeritellRunSummary,
@@ -24,11 +25,15 @@ def run_testcase(
     actual_output: str | None = None,
     *,
     response_provider: ResponseProvider | None = None,
+    judge_context: JudgeExecutionContext | None = None,
 ) -> RunResult:
     """Evaluate a single normalized test case and return a structured result."""
 
     response_text = _resolve_output(testcase, actual_output=actual_output, response_provider=response_provider)
-    assertion_results = [evaluate_registered_assertion(testcase, assertion, response_text) for assertion in testcase.assertions]
+    assertion_results = [
+        evaluate_registered_assertion(testcase, assertion, response_text, judge_context=judge_context)
+        for assertion in testcase.assertions
+    ]
     status = _derive_status(assertion_results)
     active_results = [result for result in assertion_results if result.status != "skip"]
     passed_results = [result for result in active_results if result.status == "pass"]
@@ -47,10 +52,11 @@ def run_test_suite(
     testcases: Iterable[VeritellTestCase],
     *,
     response_provider: ResponseProvider | None = None,
+    judge_context: JudgeExecutionContext | None = None,
 ) -> SuiteResult:
     """Run a suite of normalized test cases and return per-test results plus summary counts."""
 
-    results = [run_testcase(testcase, response_provider=response_provider) for testcase in testcases]
+    results = [run_testcase(testcase, response_provider=response_provider, judge_context=judge_context) for testcase in testcases]
     summary = VeritellRunSummary(
         total=len(results),
         passed=sum(result.status == "pass" for result in results),

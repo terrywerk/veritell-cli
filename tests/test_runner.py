@@ -2,8 +2,25 @@
 
 from __future__ import annotations
 
-from veritell.models import VeritellTestCase
+from veritell.backends import JudgeExecutionContext, LocalJudgeBackendUnavailable
+from veritell.models import AssertionResult, VeritellTestCase
 from veritell.runner import run_test_suite, run_testcase
+
+
+class FakeLocalJudgeBackend:
+    def evaluate_assertion(self, assertion_name: str, testcase: VeritellTestCase, response: str, *, params=None) -> AssertionResult:  # noqa: ANN001
+        return AssertionResult(
+            assertion=assertion_name,
+            status="pass",
+            method="local",
+            confidence=0.88,
+            details={"model": "fake-local"},
+        )
+
+
+class UnavailableLocalJudgeBackend:
+    def evaluate_assertion(self, assertion_name: str, testcase: VeritellTestCase, response: str, *, params=None) -> AssertionResult:  # noqa: ANN001
+        raise LocalJudgeBackendUnavailable("local judge unavailable at http://127.0.0.1:11434; ensure Ollama is running")
 
 
 def test_run_testcase_exact_match_passes() -> None:
@@ -150,7 +167,7 @@ def test_run_test_suite_counts_heuristic_no_unsupported_claims() -> None:
             name="hallucinated_case",
             input={"question": "What is the PTO policy?"},
             context={
-                "retrieved_docs": ["Contractors do not receive PTO benefits."],
+                "retrieved_docs": ["Contractors do not receive PTO benefits. Full-time employees receive 15 PTO days per year."],
             },
             metadata={"mock_response": "Contractors receive 15 PTO days per year."},
             assertions=[{"type": "no_unsupported_claims"}],
@@ -163,4 +180,60 @@ def test_run_test_suite_counts_heuristic_no_unsupported_claims() -> None:
     assert suite.summary.passed == 1
     assert suite.summary.failed == 1
     assert suite.results[0].assertion_results[0].method == "heuristic"
-    assert suite.results[1].assertion_results[0].details["unsupported_spans"] == ["Contractors receive 15 PTO days per year"]
+    assert suite.results[1].assertion_results[0].details["unsupported_spans"] == ["Contractors"]
+
+
+
+def test_run_test_suite_preserves_mixed_claim_span_details() -> None:
+    testcase = VeritellTestCase(
+        name="mixed_claims_case",
+        input={"question": "Summarize the PTO policy."},
+        context={"retrieved_docs": ["Contractors do not receive PTO benefits."]},
+        metadata={"mock_response": "Contractors do not receive PTO benefits. Contractors receive bonuses."},
+        assertions=[{"type": "no_unsupported_claims"}],
+    )
+
+    suite = run_test_suite([testcase])
+
+    assert suite.summary.failed == 1
+    assert suite.results[0].assertion_results[0].details["supported_spans"] == ["Contractors do not receive PTO benefits"]
+    assert suite.results[0].assertion_results[0].details["unsupported_span_analyses"][0]["span"] == "bonuses"
+
+
+def test_run_testcase_uses_local_judge_when_requested() -> None:
+    testcase = VeritellTestCase(
+        name="local_judge_case",
+        input={"question": "What is the PTO policy?"},
+        context={"retrieved_docs": ["Contractors do not receive PTO benefits."]},
+        metadata={"mock_response": "Contractors do not receive PTO benefits."},
+        assertions=[{"type": "no_unsupported_claims"}],
+    )
+
+    result = run_testcase(
+        testcase,
+        judge_context=JudgeExecutionContext(preferred_backend="local", local_backend=FakeLocalJudgeBackend()),
+    )
+
+    assert result.status == "pass"
+    assert result.assertion_results[0].method == "local"
+    assert result.assertion_results[0].confidence == 0.88
+
+
+
+def test_run_testcase_falls_back_to_heuristic_when_local_judge_is_unavailable() -> None:
+    testcase = VeritellTestCase(
+        name="fallback_case",
+        input={"question": "What is the PTO policy?"},
+        context={"retrieved_docs": ["Contractors do not receive PTO benefits."]},
+        metadata={"mock_response": "Contractors do not receive PTO benefits."},
+        assertions=[{"type": "no_unsupported_claims"}],
+    )
+
+    result = run_testcase(
+        testcase,
+        judge_context=JudgeExecutionContext(preferred_backend="local", local_backend=UnavailableLocalJudgeBackend()),
+    )
+
+    assert result.status == "pass"
+    assert result.assertion_results[0].method == "heuristic"
+    assert "fallback_reason" in result.assertion_results[0].details
